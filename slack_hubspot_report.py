@@ -70,25 +70,41 @@ def hs_post(url: str, token: str, payload: dict) -> dict:
     r.raise_for_status()
     return r.json()
 
-def get_pipeline_and_stages(token: str, pipeline_name: str) -> tuple[str, dict]:
-    """Retorna (pipelineId, {nome_do_estagio: id})"""
+def get_pipeline_and_stages(token: str, pipeline_name: str | None, pipeline_id_env: str | None) -> tuple[str, dict]:
+    """Retorna (pipelineId, {label: stageId}). Agora nunca faz fallback silencioso."""
     data = hs_get("https://api.hubapi.com/crm/v3/pipelines/tickets", token)
-    pipeline_id = None
-    stage_map = {}
-    for p in data.get("results", []):
-        if p.get("label") == pipeline_name or p.get("displayOrder") == pipeline_name:
-            pipeline_id = p.get("id")
-            for st in p.get("stages", []):
-                stage_map[st.get("label")] = st.get("id")
-            break
-    if pipeline_id is None:
-        # fallback: pega o primeiro pipeline e mapeia por label
-        if data.get("results"):
-            p = data["results"][0]
-            pipeline_id = p.get("id")
-            for st in p.get("stages", []):
-                stage_map[st.get("label")] = st.get("id")
+    chosen = None
+    if pipeline_id_env:
+        for p in data.get("results", []):
+            if p.get("id") == pipeline_id_env:
+                chosen = p
+                break
+        if not chosen:
+            raise RuntimeError(f"Pipeline ID {pipeline_id_env} não encontrado.")
+
+    if not chosen and pipeline_name:
+        # compara ignorando caixa e espaços extras
+        wanted = pipeline_name.strip().lower()
+        for p in data.get("results", []):
+            if p.get("label","").strip().lower() == wanted:
+                chosen = p
+                break
+        if not chosen:
+            raise RuntimeError(f"Pipeline '{pipeline_name}' não encontrado. Defina HUBSPOT_PIPELINE_ID ou ajuste o nome.")
+
+    if not chosen:
+        raise RuntimeError("Defina HUBSPOT_PIPELINE_NAME ou HUBSPOT_PIPELINE_ID nos Secrets.")
+
+    pipeline_id = chosen.get("id")
+    stage_map = { st.get("label"): st.get("id") for st in chosen.get("stages", []) }
+    # log amigável
+    print("== PIPELINE ESCOLHIDO ==")
+    print(f"ID: {pipeline_id}  LABEL: {chosen.get('label')}")
+    print("== ESTÁGIOS DISPONÍVEIS ==")
+    for lbl, sid in stage_map.items():
+        print(f"- {lbl}  ->  {sid}")
     return pipeline_id, stage_map
+
 
 def count_tickets_in_stage(token: str, pipeline_id: str, stage_id: str) -> int:
     """Usa Search API para contar tickets num estágio específico (paginação em lotes)."""
@@ -115,16 +131,25 @@ def count_tickets_in_stage(token: str, pipeline_id: str, stage_id: str) -> int:
             break
     return total
 
-def fetch_ticket_metrics(token: str, pipeline_name: str, stage_labels: List[str]) -> Dict[str, int]:
-    pipeline_id, stage_map = get_pipeline_and_stages(token, pipeline_name)
+def fetch_ticket_metrics(token: str, pipeline_name: str | None, stage_labels: List[str]) -> Dict[str, int]:
+    pipeline_id, stage_map = get_pipeline_and_stages(
+        token,
+        pipeline_name=os.getenv("HUBSPOT_PIPELINE_NAME", pipeline_name),
+        pipeline_id_env=os.getenv("HUBSPOT_PIPELINE_ID")
+    )
     metrics: Dict[str, int] = {}
     for label in stage_labels:
-        stage_id = stage_map.get(label)
+        # normaliza pequenas variações (hífen/en-dash; mai/min; espaços)
+        candidates = {k: v for k, v in stage_map.items()
+                      if k.strip().lower().replace("–","-") == label.strip().lower().replace("–","-")}
+        stage_id = next(iter(candidates.values()), None)
         if not stage_id:
+            print(f"[WARN] Estágio '{label}' não encontrado no pipeline. Vai sair 0.")
             metrics[label] = 0
             continue
         metrics[label] = count_tickets_in_stage(token, pipeline_id, stage_id)
     return metrics
+
 
 # =================== CONVERSAS (Inbox) ===================
 # Observação: a API de Conversas é separada (conversations/v3). Para um setup rápido,
