@@ -1,0 +1,6 @@
+python-dotenv
+slack_sdk
+hubspot-api-client
+pillow
+pytz
+requests
