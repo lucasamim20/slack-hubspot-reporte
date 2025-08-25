@@ -1,7 +1,19 @@
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import re
 
+def normalize_label(txt: str) -> str:
+    """
+    Normaliza labels para comparação:
+    - remove emojis e símbolos não alfanuméricos (mantém letras acentuadas, números, espaço e '-')
+    - troca en-dash/em-dash por '-'
+    - lowercase e trim
+    """
+    txt = txt.replace("–", "-").replace("—", "-")
+    # mantém letras (inclui acentuadas), dígitos, espaço e '-'
+    txt = re.sub(r"[^\w\sÀ-ÿ-]", "", txt)
+    return txt.strip().lower()
 import os
 import io
 import json
@@ -139,16 +151,20 @@ def fetch_ticket_metrics(token: str, pipeline_name: str | None, stage_labels: Li
     )
     metrics: Dict[str, int] = {}
     for label in stage_labels:
-        # normaliza pequenas variações (hífen/en-dash; mai/min; espaços)
-        candidates = {k: v for k, v in stage_map.items()
-                      if k.strip().lower().replace("–","-") == label.strip().lower().replace("–","-")}
-        stage_id = next(iter(candidates.values()), None)
-        if not stage_id:
-            print(f"[WARN] Estágio '{label}' não encontrado no pipeline. Vai sair 0.")
-            metrics[label] = 0
-            continue
-        metrics[label] = count_tickets_in_stage(token, pipeline_id, stage_id)
-    return metrics
+   # antes:
+# candidates = {k: v for k, v in stage_map.items()
+#               if k.strip().lower().replace("–","-") == label.strip().lower().replace("–","-")}
+
+# depois (usa normalização robusta):
+norm_stage_map = {normalize_label(k): v for k, v in stage_map.items()}
+for label in stage_labels:
+    key = normalize_label(label)
+    stage_id = norm_stage_map.get(key)
+    if not stage_id:
+        print(f"[WARN] Estágio não encontrado: '{label}' (normalizado='{key}'). Disponíveis: {list(norm_stage_map.keys())}")
+        metrics[label] = 0
+        continue
+    metrics[label] = count_tickets_in_stage(token, pipeline_id, stage_id)
 
 
 # =================== CONVERSAS (Inbox) ===================
@@ -262,23 +278,24 @@ def main():
     pipeline_name = os.getenv("HUBSPOT_PIPELINE_NAME", "Experiência do Cliente")
 
     # Estágios que queremos contar (a ordem bate com o template que você mandou)
-    stage_labels = [
-        "Novo",
-        "Coletar Pendências",
-        "Em tratativa",
-        "Retorno",
-        "2ª Tentativa",
-        "3ª Tentativa",
-        "Solicita Imagem",
-        "Financeiro",
-        "Proativos - CGS",
-        "Erros automação",
-        "Centro de Gestão de Serviço",
-        "Ocorrência",
-        "Logística",
-        "Readequação",
-        "Concluído",
-    ]
+  stage_labels = [
+    "Novo",
+    "Coletar Pendências",
+    "Em tratativa",
+    "Retorno",
+    "2ª Tentativa",
+    "3ª Tentativa",
+    "Solicita Imagem",      # ← sem emoji aqui
+    "Financeiro",
+    "Proativos - CGS",
+    "Erros automação",
+    "Centro de Gestão de Serviço",
+    "Ocorrência",
+    "Logística",
+    "Readequação",
+    "Concluído",
+]
+
 
     ticket_metrics = {}
     if hs_token:
