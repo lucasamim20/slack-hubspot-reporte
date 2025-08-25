@@ -1,0 +1,30 @@
+name: HubSpot → Slack Report (Turnos)
+
+on:
+  schedule:
+    # 06:20 SP → 09:20 UTC
+    - cron: "20 9 * * *"
+    # 15:20 SP → 18:20 UTC
+    - cron: "20 18 * * *"
+    # 23:00 SP → 02:00 UTC
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [slack_report]
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run report
+        env:
+          HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          REPORT_TIMEZONE: ${{ secrets.REPORT_TIMEZONE }}
+        run: python slack_hubspot_report.py --date hoje
