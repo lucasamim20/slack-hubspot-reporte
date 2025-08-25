@@ -9,18 +9,28 @@ on:
     # 23:00 SP → 02:00 UTC
     - cron: "0 2 * * *"
   workflow_dispatch:
-  repository_dispatch:
-    types: [slack_report]
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Show repo contents (debug)
+        run: |
+          pwd
+          ls -la
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
+
+      # 👉 instala as libs direto (sem requirements.txt)
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install python-dotenv slack_sdk hubspot-api-client pillow pytz requests
+
       - name: Run report
         env:
           HUBSPOT_TOKEN: ${{ secrets.HUBSPOT_TOKEN }}
@@ -28,3 +38,4 @@ jobs:
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
           REPORT_TIMEZONE: ${{ secrets.REPORT_TIMEZONE }}
         run: python slack_hubspot_report.py --date hoje
+
