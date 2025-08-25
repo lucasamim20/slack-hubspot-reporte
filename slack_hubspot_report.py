@@ -1,38 +1,27 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import re
 
-def normalize_label(txt: str) -> str:
-    """
-    Normaliza labels para comparação:
-    - remove emojis e símbolos não alfanuméricos (mantém letras acentuadas, números, espaço e '-')
-    - troca en-dash/em-dash por '-'
-    - lowercase e trim
-    """
-    txt = txt.replace("–", "-").replace("—", "-")
-    # mantém letras (inclui acentuadas), dígitos, espaço e '-'
-    txt = re.sub(r"[^\w\sÀ-ÿ-]", "", txt)
-    return txt.strip().lower()
 import os
 import io
+import re
 import json
 import argparse
-import math
-import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, List, Optional
 
+import requests
 from dotenv import load_dotenv
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from PIL import Image, ImageDraw, ImageFont
 
+# =================== CONFIG ===================
+
 TEMPLATE_PATH = os.getenv("REPORT_TEMPLATE_PATH", "report_template.png")
 
-# =================== AJUSTE O LAYOUT AQUI ===================
-CELL_COORDS = {
+# Coordenadas (x, y) de cada campo no template
+CELL_COORDS: Dict[str, tuple[int, int]] = {
     # Tickets (coluna "Turno atual")
     "Novo": (330, 120),
     "Coletar Pendências": (330, 140),
@@ -48,7 +37,7 @@ CELL_COORDS = {
     "Ocorrência": (330, 340),
     "Logística": (330, 360),
     "Readequação": (330, 380),
-    "Concluído": (330, 400),  # normalmente você não reporta, pode remover
+    "Concluído": (330, 400),
 
     # Conversas (coluna "Turno atual")
     "Tudo aberto em conversas": (330, 420),
@@ -57,16 +46,47 @@ CELL_COORDS = {
     "Tempo máx. última resposta (min)": (330, 480),
 }
 
-def _load_font(size: int):
-    from PIL import ImageFont
+# Estágios que queremos contar (pode manter "limpo"; emojis e traços diferentes serão normalizados)
+STAGE_LABELS: List[str] = [
+    "Novo",
+    "Coletar Pendências",
+    "Em tratativa",
+    "Retorno",
+    "2ª Tentativa",
+    "3ª Tentativa",
+    "Solicita Imagem",      # mesmo que no HubSpot tenha emoji, a normalização trata
+    "Financeiro",
+    "Proativos - CGS",
+    "Erros automação",
+    "Centro de Gestão de Serviço",
+    "Ocorrência",
+    "Logística",
+    "Readequação",
+    "Concluído",
+]
+
+# =================== UTILS ===================
+
+def _load_font(size: int) -> ImageFont.FreeTypeFont:
     try:
         return ImageFont.truetype("DejaVuSans-Bold.ttf", size=size)
     except Exception:
         return ImageFont.load_default()
 
-# =================== HUBSPOT: TICKETS POR ESTÁGIO ===================
+def normalize_label(txt: str) -> str:
+    """
+    Normaliza labels para comparação:
+    - troca –/— por -
+    - remove emojis e símbolos não alfanuméricos (mantém letras acentuadas, dígitos, espaço e '-')
+    - trim + lowercase
+    """
+    txt = txt.replace("–", "-").replace("—", "-")
+    txt = re.sub(r"[^\w\sÀ-ÿ-]", "", txt)
+    return txt.strip().lower()
 
-def hs_get(url: str, token: str, params: dict | None = None) -> dict:
+# =================== HUBSPOT HELPERS ===================
+
+def hs_get(url: str, token: str, params: Optional[dict] = None) -> dict:
     r = requests.get(url, headers={
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -82,9 +102,15 @@ def hs_post(url: str, token: str, payload: dict) -> dict:
     r.raise_for_status()
     return r.json()
 
-def get_pipeline_and_stages(token: str, pipeline_name: str | None, pipeline_id_env: str | None) -> tuple[str, dict]:
-    """Retorna (pipelineId, {label: stageId}). Agora nunca faz fallback silencioso."""
+def get_pipeline_and_stages(token: str,
+                            pipeline_name_env: Optional[str],
+                            pipeline_id_env: Optional[str]) -> tuple[str, Dict[str, str]]:
+    """
+    Retorna (pipelineId, {label: stageId}) do pipeline de tickets.
+    Se HUBSPOT_PIPELINE_ID for fornecido, usa ele; senão, tenta pelo HUBSPOT_PIPELINE_NAME (label exato).
+    """
     data = hs_get("https://api.hubapi.com/crm/v3/pipelines/tickets", token)
+
     chosen = None
     if pipeline_id_env:
         for p in data.get("results", []):
@@ -92,91 +118,107 @@ def get_pipeline_and_stages(token: str, pipeline_name: str | None, pipeline_id_e
                 chosen = p
                 break
         if not chosen:
-            raise RuntimeError(f"Pipeline ID {pipeline_id_env} não encontrado.")
+            raise RuntimeError(f"Pipeline ID {pipeline_id_env} não encontrado nos pipelines de tickets.")
 
-    if not chosen and pipeline_name:
-        # compara ignorando caixa e espaços extras
-        wanted = pipeline_name.strip().lower()
+    if not chosen and pipeline_name_env:
+        wanted = pipeline_name_env.strip().lower()
         for p in data.get("results", []):
-            if p.get("label","").strip().lower() == wanted:
+            if p.get("label", "").strip().lower() == wanted:
                 chosen = p
                 break
         if not chosen:
-            raise RuntimeError(f"Pipeline '{pipeline_name}' não encontrado. Defina HUBSPOT_PIPELINE_ID ou ajuste o nome.")
+            raise RuntimeError(f"Pipeline '{pipeline_name_env}' não encontrado. "
+                               f"Ajuste HUBSPOT_PIPELINE_NAME ou defina HUBSPOT_PIPELINE_ID.")
 
     if not chosen:
         raise RuntimeError("Defina HUBSPOT_PIPELINE_NAME ou HUBSPOT_PIPELINE_ID nos Secrets.")
 
     pipeline_id = chosen.get("id")
-    stage_map = { st.get("label"): st.get("id") for st in chosen.get("stages", []) }
-    # log amigável
+    stage_map: Dict[str, str] = {st.get("label"): st.get("id") for st in chosen.get("stages", [])}
+
+    # Logs úteis
     print("== PIPELINE ESCOLHIDO ==")
     print(f"ID: {pipeline_id}  LABEL: {chosen.get('label')}")
     print("== ESTÁGIOS DISPONÍVEIS ==")
     for lbl, sid in stage_map.items():
-        print(f"- {lbl}  ->  {sid}")
+        print(f"- {lbl} -> {sid}")
+
     return pipeline_id, stage_map
 
-
 def count_tickets_in_stage(token: str, pipeline_id: str, stage_id: str) -> int:
-    """Usa Search API para contar tickets num estágio específico (paginação em lotes)."""
+    """
+    Conta tickets num estágio específico usando a Search API.
+    Usa as propriedades corretas: hs_pipeline e hs_pipeline_stage.
+    """
     url = "https://api.hubapi.com/crm/v3/objects/tickets/search"
     total = 0
     after = None
+
     while True:
         payload = {
             "filterGroups": [{
                 "filters": [
-                    {"propertyName": "pipeline", "operator": "EQ", "value": pipeline_id},
+                    {"propertyName": "hs_pipeline", "operator": "EQ", "value": pipeline_id},
                     {"propertyName": "hs_pipeline_stage", "operator": "EQ", "value": stage_id},
                 ]
             }],
             "limit": 100,
-            "properties": ["hs_pipeline_stage"],
+            "properties": ["hs_pipeline", "hs_pipeline_stage"],
         }
         if after:
             payload["after"] = after
-        data = hs_post(url, token, payload)
+
+        try:
+            data = hs_post(url, token, payload)
+        except requests.HTTPError as e:
+            try:
+                print("Search payload:", payload)
+                print("Search error body:", e.response.text)
+            except Exception:
+                pass
+            raise
+
         total += len(data.get("results", []))
         after = data.get("paging", {}).get("next", {}).get("after")
         if not after:
             break
+
     return total
 
-def fetch_ticket_metrics(token: str, pipeline_name: str | None, stage_labels: List[str]) -> Dict[str, int]:
+def fetch_ticket_metrics(token: str,
+                         pipeline_name_default: Optional[str],
+                         stage_labels: List[str]) -> Dict[str, int]:
     pipeline_id, stage_map = get_pipeline_and_stages(
         token,
-        pipeline_name=os.getenv("HUBSPOT_PIPELINE_NAME", pipeline_name),
-        pipeline_id_env=os.getenv("HUBSPOT_PIPELINE_ID")
+        pipeline_name_env=os.getenv("HUBSPOT_PIPELINE_NAME", pipeline_name_default or ""),
+        pipeline_id_env=os.getenv("HUBSPOT_PIPELINE_ID"),
     )
+
+    # mapa normalizado: "solicita imagem" -> "<stage_id>"
+    norm_stage_map: Dict[str, str] = {normalize_label(k): v for k, v in stage_map.items()}
+
     metrics: Dict[str, int] = {}
     for label in stage_labels:
-   # antes:
-# candidates = {k: v for k, v in stage_map.items()
-#               if k.strip().lower().replace("–","-") == label.strip().lower().replace("–","-")}
+        key = normalize_label(label)
+        stage_id = norm_stage_map.get(key)
+        if not stage_id:
+            print(f"[WARN] Estágio não encontrado: '{label}' (normalizado='{key}'). "
+                  f"Disponíveis: {list(norm_stage_map.keys())}")
+            metrics[label] = 0
+            continue
 
-# depois (usa normalização robusta):
-norm_stage_map = {normalize_label(k): v for k, v in stage_map.items()}
-for label in stage_labels:
-    key = normalize_label(label)
-    stage_id = norm_stage_map.get(key)
-    if not stage_id:
-        print(f"[WARN] Estágio não encontrado: '{label}' (normalizado='{key}'). Disponíveis: {list(norm_stage_map.keys())}")
-        metrics[label] = 0
-        continue
-    metrics[label] = count_tickets_in_stage(token, pipeline_id, stage_id)
+        metrics[label] = count_tickets_in_stage(token, pipeline_id, stage_id)
 
+    return metrics
 
 # =================== CONVERSAS (Inbox) ===================
-# Observação: a API de Conversas é separada (conversations/v3). Para um setup rápido,
-# deixamos os contadores opcionais. Se você quiser usar, crie um App com escopo "conversations.read".
 
 def fetch_conversation_metrics(token: str, inbox_id: Optional[str] = None) -> Dict[str, int]:
-    # Placeholders seguros. Preencha se quiser medir via API:
-    # - Tudo aberto em conversas: soma de threads status=OPEN
-    # - Não atribuído: threads OPEN sem "assignedUserId"
-    # - Última Resposta (cliente): threads em que a última mensagem é INBOUND (aproximação)
-    # - Tempo máx. última resposta (min): maior delta entre agora e "lastMessageReceivedTimestamp"
+    """
+    Placeholders seguros. Para ligar de verdade:
+      - habilite escopo conversations.read no Private App
+      - consulte /conversations/v3/threads filtrando por status/assigned/lastMessage
+    """
     return {
         "Tudo aberto em conversas": 0,
         "Não atribuído": 0,
@@ -187,7 +229,6 @@ def fetch_conversation_metrics(token: str, inbox_id: Optional[str] = None) -> Di
 # =================== IMAGEM ===================
 
 def render_image(metrics: Dict[str, int], date_label: str) -> bytes:
-    from PIL import Image, ImageDraw
     img = Image.open(TEMPLATE_PATH).convert("RGBA")
     draw = ImageDraw.Draw(img)
     font = _load_font(16)
@@ -195,11 +236,17 @@ def render_image(metrics: Dict[str, int], date_label: str) -> bytes:
     # Data no topo direito
     draw.text((img.width - 160, 10), date_label, font=font, fill=(0, 0, 0, 255))
 
+    # Rótulos auxiliares (debug)
+    show_keys = os.getenv("SHOW_KEYS", "0") == "1"
+    key_font = _load_font(10)
+
     for key, value in metrics.items():
         if key not in CELL_COORDS:
             continue
         x, y = CELL_COORDS[key]
         draw.text((x, y), str(value), font=font, fill=(0, 0, 0, 255))
+        if show_keys:
+            draw.text((x + 28, y - 12), key, font=key_font, fill=(60, 60, 60, 255))
 
     out = io.BytesIO()
     img.save(out, format="PNG")
@@ -239,14 +286,17 @@ Eras isso meu povo, vamos que bora que essa semana agosto acaba!! Boa semana a t
 
 def post_to_slack(token: str, channel: str, text: str, image_bytes: bytes, date_label: str):
     client = WebClient(token=token)
-    upload = client.files_upload_v2(
-        channel=channel,
-        filename=f"reporte_operacional_{date_label}.png",
-        file=image_bytes,
-        title=f"Reporte Operacional - {date_label}",
-        initial_comment=text,
-    )
-    return upload
+    try:
+        upload = client.files_upload_v2(
+            channel=channel,
+            filename=f"reporte_operacional_{date_label}.png",
+            file=image_bytes,
+            title=f"Reporte Operacional - {date_label}",
+            initial_comment=text,
+        )
+        return upload
+    except SlackApiError as e:
+        raise RuntimeError(f"Erro ao enviar para Slack: {e.response.get('error')}") from e
 
 # =================== MAIN ===================
 
@@ -265,6 +315,7 @@ def main():
     elif args.date.lower() == "ontem":
         report_date = now_local - timedelta(days=1)
     else:
+        # aceita YYYY-MM-DD
         report_date = datetime.fromisoformat(args.date).replace(tzinfo=tz)
 
     date_label = report_date.strftime("%d/%m/%Y (%a)")
@@ -272,53 +323,40 @@ def main():
     slack_token = os.getenv("SLACK_BOT_TOKEN", "")
     slack_channel = os.getenv("SLACK_CHANNEL_ID", "")
     if not slack_token or not slack_channel:
-        raise SystemExit("Preencha SLACK_BOT_TOKEN e SLACK_CHANNEL_ID no .env.")
+        raise SystemExit("Preencha SLACK_BOT_TOKEN e SLACK_CHANNEL_ID (env/Secrets).")
 
     hs_token = os.getenv("HUBSPOT_TOKEN", "")
+    if not hs_token:
+        raise SystemExit("Preencha HUBSPOT_TOKEN (env/Secrets).")
+
     pipeline_name = os.getenv("HUBSPOT_PIPELINE_NAME", "Experiência do Cliente")
 
-    # Estágios que queremos contar (a ordem bate com o template que você mandou)
-  stage_labels = [
-    "Novo",
-    "Coletar Pendências",
-    "Em tratativa",
-    "Retorno",
-    "2ª Tentativa",
-    "3ª Tentativa",
-    "Solicita Imagem",      # ← sem emoji aqui
-    "Financeiro",
-    "Proativos - CGS",
-    "Erros automação",
-    "Centro de Gestão de Serviço",
-    "Ocorrência",
-    "Logística",
-    "Readequação",
-    "Concluído",
-]
+    # Tickets
+    try:
+        ticket_metrics = fetch_ticket_metrics(hs_token, pipeline_name, STAGE_LABELS)
+    except Exception as e:
+        print("Falha ao buscar tickets do HubSpot:", e)
+        ticket_metrics = {label: 0 for label in STAGE_LABELS}
 
-
-    ticket_metrics = {}
-    if hs_token:
-        try:
-            ticket_metrics = fetch_ticket_metrics(hs_token, pipeline_name, stage_labels)
-        except Exception as e:
-            # Evita quebrar o envio por conta de erro de HubSpot
-            print("Falha ao buscar tickets do HubSpot:", e)
-            ticket_metrics = {label: 0 for label in stage_labels}
-    else:
-        ticket_metrics = {label: 0 for label in stage_labels}
-
-    # Conversas (opcional)
+    # Conversas (opcional; 0 por padrão)
     conv_metrics = fetch_conversation_metrics(os.getenv("HUBSPOT_TOKEN", ""), os.getenv("HUBSPOT_INBOX_ID"))
 
-    # Junta para desenhar
-    metrics = {}
+    # Junta
+    metrics: Dict[str, int] = {}
     metrics.update(ticket_metrics)
     metrics.update(conv_metrics)
 
+    # Debug sem postar no Slack
+    if os.getenv("DRY_RUN", "0") == "1":
+        print("== MÉTRICAS ==")
+        for k, v in metrics.items():
+            print(f"{k}: {v}")
+        return
+
+    # Gera imagem
     image_bytes = render_image(metrics, date_label)
 
-    # Slots (exemplo; troque por fonte real se tiver)
+    # Slots (exemplo; troque por sua fonte real quando tiver)
     slots_lines = """25/08 - :sp: SP - 0 vagas
 25/08 - :rj:  RJ - 0 vagas (1 excedente)
 26/08 - :sp: SP - 3 vagas
@@ -328,6 +366,7 @@ def main():
 
     text = build_message(slots_lines)
 
+    # Envia pro Slack
     resp = post_to_slack(slack_token, slack_channel, text, image_bytes, date_label)
     print(json.dumps({"ok": True, "file": resp.get("file", {}), "date": date_label}, ensure_ascii=False))
 
